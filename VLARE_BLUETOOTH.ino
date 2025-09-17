@@ -17,11 +17,21 @@
 #define PACKET_BUFFER_SIZE 256
 #define MAX_FILENAME_LEN 16
 
+#define CMD_CONNECT_WIFI 0x10
+#define CMD_SEND_WIFI_PASS 0x11
+#define CMD_CONFIRM_WIFI_CONN 0x12
 #define CMD_GET_STATUS 0x13
 #define CMD_START_FILE_TRANSFER 0x14
 #define CMD_END_FILE_TRANSFER 0x15
+#define CMD_SET_PICK_VALUE 0x16
+#define CMD_SET_RPM 0x17
 #define CMD_SET_DEVICE_NAME 0x20
 #define CMD_GET_DEVICE_NAME 0x21
+
+#define SUCCESS 0x00
+#define LENGTH_MISMATCH 0x01
+#define CRC_CHECK_FAILED 0x02
+#define ERROR 0x03
 
 char bodyFileName[MAX_FILENAME_LEN + 1] = "No File";
 uint32_t bodyTotalPicks = 0;
@@ -31,6 +41,7 @@ uint32_t borderTotalPicks = 0;
 uint32_t borderCurrentPicks = 0;
 String fullDeviceName;
 byte packetBuffer[PACKET_BUFFER_SIZE];
+uint16_t currentRPM = 0;
 
 bool isReceivingFile = false;
 File uploadFile;
@@ -76,6 +87,37 @@ void processIncomingPacket(byte* packetData, size_t len) {
   byte* data = &packetData[3];
   Serial.print("Processing Command: 0x");
   Serial.println(command, HEX);
+
+  // 1. Basic Validation: Header, Footer, and Minimum Length (Header, Cmd, Len, CRC, Footer)
+  if (len < 5 || packetData[0] != PACKET_HEADER || packetData[len - 1] != PACKET_FOOTER) {
+    Serial.println("Invalid packet structure (Header/Footer/Length).");
+    return;
+  }
+
+
+  byte receivedCRC = packetData[3 + dataLen];
+
+  // 2. Data Length Validation
+  // The total length should be Header(1) + Cmd(1) + Len(1) + Data(dataLength) + CRC(1) + Footer(1)
+  if (len != dataLen + 5) {
+    Serial.println("Packet length mismatch.");
+    byte errorData[] = { LENGTH_MISMATCH };
+    sendResponsePacket(command, errorData, 1);
+    return;
+  }
+
+  // 3. CRC Validation
+  byte calculated_crc = calculateCRC(data, dataLen);
+  if (calculated_crc != receivedCRC) {
+    Serial.printf("CRC mismatch! Received: 0x%02X, Calculated: 0x%02X\n", receivedCRC, calculated_crc);
+    byte errorData[] = { CRC_CHECK_FAILED };
+    sendResponsePacket(command, errorData, 1);
+    return;
+  }
+
+  Serial.printf("Packet Validated! Command: 0x%02X\n", command);
+
+
   switch (command) {
     case CMD_GET_STATUS:
       {
@@ -97,7 +139,7 @@ void processIncomingPacket(byte* packetData, size_t len) {
         Serial.println("Received START_FILE_TRANSFER command.");
         if (dataLen < 6) {
           Serial.printf("ERROR: Invalid data length for START_FILE_TRANSFER. Expected >= 6, got %d\n", dataLen);
-          byte errorData[] = { 0x01 };  // Error: Bad length
+          byte errorData[] = { LENGTH_MISMATCH };  // Error: Bad length
           sendResponsePacket(CMD_START_FILE_TRANSFER, errorData, 1);
           break;
         }
@@ -107,7 +149,7 @@ void processIncomingPacket(byte* packetData, size_t len) {
 
         if (fileNameLen > MAX_FILENAME_LEN) {
           Serial.printf("ERROR: Filename is too long. Max %d, got %d\n", MAX_FILENAME_LEN, fileNameLen);
-          byte errorData[] = { 0x04 };  
+          byte errorData[] = { LENGTH_MISMATCH };
           sendResponsePacket(CMD_START_FILE_TRANSFER, errorData, 1);
           break;
         }
@@ -122,14 +164,14 @@ void processIncomingPacket(byte* packetData, size_t len) {
         if (fileType == 0x01) {
           filePath = "/body.dat";
           strcpy(bodyFileName, receivedFileName);
-          bodyTotalPicks = expectedFileSize; 
+          bodyTotalPicks = expectedFileSize;
         } else if (fileType == 0x02) {
           filePath = "/border.dat";
           strcpy(borderFileName, receivedFileName);
           borderTotalPicks = expectedFileSize;
         } else {
           Serial.printf("ERROR: Unknown file type 0x%02X\n", fileType);
-          byte errorData[] = { 0x02 }; 
+          byte errorData[] = { ERROR };
           sendResponsePacket(CMD_START_FILE_TRANSFER, errorData, 1);
           break;
         }
@@ -137,13 +179,13 @@ void processIncomingPacket(byte* packetData, size_t len) {
         uploadFile = LittleFS.open(filePath, "w");
         if (!uploadFile) {
           Serial.println("ERROR: Failed to open file for writing!");
-          byte errorData[] = { 0x03 };
+          byte errorData[] = { ERROR };
           sendResponsePacket(CMD_START_FILE_TRANSFER, errorData, 1);
           break;
         }
         bytesReceived = 0;
         isReceivingFile = true;
-        byte successData[] = { 0x00 };
+        byte successData[] = { SUCCESS };
         sendResponsePacket(CMD_START_FILE_TRANSFER, successData, 1);
         break;
       }
@@ -155,8 +197,68 @@ void processIncomingPacket(byte* packetData, size_t len) {
           isReceivingFile = false;
           Serial.printf("File transfer ended by command. Received %d/%d bytes.\n", bytesReceived, expectedFileSize);
         }
-        byte successData[] = { 0x00 };
+        byte successData[] = { SUCCESS };
         sendResponsePacket(CMD_END_FILE_TRANSFER, successData, 1);
+        break;
+      }
+    case CMD_SET_PICK_VALUE:
+      {
+        Serial.println("Received SET_PICK_VALUE command.");
+        // Expected data: 1 byte for type (Body/Border) + 4 bytes for value
+        if (dataLen != 5) {
+          Serial.printf("ERROR: Invalid data length for SET_PICK_VALUE. Expected 5, got %d\n", dataLen);
+          byte errorData[] = { LENGTH_MISMATCH };
+          sendResponsePacket(CMD_SET_PICK_VALUE, errorData, 1);
+          break;
+        }
+
+        byte pickType = data[0];
+        uint32_t newPickValue;
+        memcpy(&newPickValue, &data[1], 4);  // Safely copy 4 bytes into the uint32_t
+
+        if (pickType == 0x01) {  // 0x01 for Body
+          bodyCurrentPicks = newPickValue;
+          Serial.printf("Body picks set to %u\n", newPickValue);
+          byte successData[] = { SUCCESS };
+          sendResponsePacket(CMD_SET_PICK_VALUE, successData, 1);
+        } else if (pickType == 0x02) {  // 0x02 for Border
+          borderCurrentPicks = newPickValue;
+          Serial.printf("Border picks set to %u\n", newPickValue);
+          byte successData[] = { SUCCESS };
+          sendResponsePacket(CMD_SET_PICK_VALUE, successData, 1);
+        } else {
+          Serial.printf("ERROR: Unknown pick type 0x%02X\n", pickType);
+          byte errorData[] = { ERROR };
+          sendResponsePacket(CMD_SET_PICK_VALUE, errorData, 1);
+        }
+        break;
+      }
+
+    case CMD_SET_RPM:
+      {
+        Serial.println("Received SET_RPM command.");
+        // Expected data: 2 bytes for the RPM value (uint16_t)
+        if (dataLen != 2) {
+          Serial.printf("ERROR: Invalid data length for SET_RPM. Expected 2, got %d\n", dataLen);
+          byte errorData[] = { LENGTH_MISMATCH };
+          sendResponsePacket(CMD_SET_RPM, errorData, 1);
+          break;
+        }
+
+        uint16_t newRPM;
+        memcpy(&newRPM, data, 2);  // Safely copy 2 bytes into the uint16_t
+
+        currentRPM = newRPM;  // Assumes you have a global 'uint16_t currentRPM;'
+
+        // Optional: Save the RPM value so it persists after a reboot
+        preferences.begin("vlare-loom", false);
+        preferences.putUShort("rpmValue", newRPM);
+        preferences.end();
+
+        Serial.printf("RPM set to %u and saved.\n", currentRPM);
+
+        byte successData[] = { SUCCESS };
+        sendResponsePacket(CMD_SET_RPM, successData, 1);
         break;
       }
     case CMD_SET_DEVICE_NAME:
@@ -169,7 +271,7 @@ void processIncomingPacket(byte* packetData, size_t len) {
         preferences.putString("customName", newName);
         preferences.end();
         Serial.printf("Device name updated to: %s\n", newName);
-        byte successData[] = { 0x00 };
+        byte successData[] = { SUCCESS };
         sendResponsePacket(CMD_SET_DEVICE_NAME, successData, 1);
         Serial.println("Rebooting to apply new name...");
         delay(100);
@@ -271,7 +373,7 @@ void handleBluetooth() {
 #if defined(VLARE_CLASSIC_BLUETOOTH)
   if (isReceivingFile) {
     if (SerialBT.available()) {
-     
+
       size_t bytesToRead = min((size_t)SerialBT.available(), (size_t)PACKET_BUFFER_SIZE);
       size_t bytesRead = SerialBT.readBytes(packetBuffer, bytesToRead);
       uploadFile.write(packetBuffer, bytesRead);
