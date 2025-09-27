@@ -25,8 +25,7 @@
 #define CMD_END_FILE_TRANSFER 0x15
 #define CMD_SET_PICK_VALUE 0x16
 #define CMD_SET_RPM 0x17
-#define CMD_SET_DEVICE_NAME 0x20
-#define CMD_GET_DEVICE_NAME 0x21
+#define CMD_SET_DEVICE_NAME 0x18
 
 #define SUCCESS 0x00
 #define LENGTH_MISMATCH 0x01
@@ -162,11 +161,11 @@ void processIncomingPacket(byte* packetData, size_t len) {
         memcpy(&expectedFileSize, &data[1 + fileNameLen], 4);
         String filePath;
         if (fileType == 0x01) {
-          filePath = "/body.dat";
+          filePath = "/body.bmp";
           strcpy(bodyFileName, receivedFileName);
           bodyTotalPicks = expectedFileSize;
         } else if (fileType == 0x02) {
-          filePath = "/border.dat";
+          filePath = "/border.bmp";
           strcpy(borderFileName, receivedFileName);
           borderTotalPicks = expectedFileSize;
         } else {
@@ -278,18 +277,6 @@ void processIncomingPacket(byte* packetData, size_t len) {
         ESP.restart();
         break;
       }
-    case CMD_GET_DEVICE_NAME:
-      {
-        Serial.println("Received GET_DEVICE_NAME command.");
-        preferences.begin("vlare-loom", true);
-        String name = preferences.getString("customName", "Device");
-        preferences.end();
-        sendResponsePacket(CMD_GET_DEVICE_NAME, (byte*)name.c_str(), name.length());
-        break;
-      }
-    default:
-      Serial.printf("Unknown command received: 0x%02X\n", command);
-      break;
   }
 }
 
